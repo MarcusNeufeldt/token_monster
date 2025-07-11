@@ -1,0 +1,102 @@
+# Grok Heavy Multi-Agent AI System Configuration
+
+# OpenRouter API Configuration
+api:
+  base_url: "https://openrouter.ai/api/v1"
+  timeout: 60
+  max_retries: 3
+
+# Agent Configuration - Specialized Roles
+agents:
+  - name: "planner_agent"
+    model: "x-ai/grok-3-mini-beta"
+    role: "planner"
+    description: "Strategic planning agent that breaks down complex queries into actionable sub-tasks"
+    reasoning_effort: "high"
+    specialization: "task_decomposition"
+    capabilities: ["planning", "strategic_thinking", "task_breakdown"]
+    
+  - name: "researcher_agent"
+    model: "x-ai/grok-3-mini-beta"
+    role: "researcher"
+    description: "Research specialist that gathers information and executes investigations using tools"
+    reasoning_effort: "high"
+    specialization: "information_gathering"
+    capabilities: ["web_search", "code_execution", "data_analysis", "fact_finding"]
+    
+  - name: "critic_agent"
+    model: "x-ai/grok-3-mini-beta"
+    role: "critic"
+    description: "Quality assurance agent that reviews work for accuracy, completeness, and bias"
+    reasoning_effort: "high"
+    specialization: "quality_control"
+    capabilities: ["error_detection", "bias_analysis", "completeness_review", "fact_checking"]
+    
+  - name: "synthesizer_agent"
+    model: "x-ai/grok-3-mini-beta"
+    role: "synthesizer"
+    description: "Content creation specialist that combines research into comprehensive, well-structured responses"
+    reasoning_effort: "high"
+    specialization: "content_creation"
+    capabilities: ["writing", "synthesis", "organization", "clarity"]
+
+# Deliberation Configuration - Enhanced Multi-Round Process
+deliberation:
+  synthesis_model: "x-ai/grok-3-mini-beta"
+  max_context_length: 8000
+  enable_critique_rounds: true
+  max_critique_rounds: 1  # Reduced for speed
+  orchestration_mode: "parallel"  # Changed back to parallel for speed
+
+# Dynamic Agent Spawning Configuration
+dynamic_spawning:
+  enabled: true
+  max_spawned_agents: 10  # Maximum total agents (base + spawned)
+  spawning_triggers:
+    complexity_threshold: 6  # Spawn agents when complexity score >= 6
+    comparison_keywords: ["compare", "vs", "versus", "contrast", "difference between"]
+    multi_task_keywords: ["and write", "and create", "and analyze", "also", "then"]
+    geographic_keywords: ["US", "China", "Europe", "countries", "nations"]
+    coding_keywords: ["python", "script", "code", "program", "visualization"]
+  
+  # Agent templates for dynamic spawning
+  agent_templates:
+    comparative_researcher:
+      base_role: "researcher"
+      specialization: "comparative_analysis"
+      focus_area: "{subject}"  # Placeholder for specific subject
+    
+    geographic_researcher:
+      base_role: "researcher" 
+      specialization: "geographic_research"
+      focus_area: "{region}"  # Placeholder for specific region
+    
+    coder_specialist:
+      base_role: "researcher"
+      specialization: "code_generation"
+      focus_area: "programming"
+      capabilities: ["code_executor", "data_visualization"]
+
+# System Settings
+system:
+  max_parallel_workers: 3
+  task_timeout: 120  # Increased for sequential orchestration
+  log_level: "INFO"
+  save_logs: true
+  logs_directory: "logs"
+
+# Tool Configuration
+tools:
+  web_search:
+    enabled: true
+    max_results: 5
+    
+  code_executor:
+    enabled: true
+    timeout: 10
+    sandbox: true
+    
+  data_explorer:
+    enabled: true
+    timeout: 15
+    sandbox: true 
