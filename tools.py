@@ -39,7 +39,7 @@ class ToolExecutor:
             if tool_name == "web_search":
                 return await self.web_search(kwargs.get('query', ''))
             elif tool_name == "code_executor":
-                return await self.execute_code(kwargs.get('code', ''))
+                return await self.execute_code(kwargs.get('code', ''), kwargs.get('output_dir'))
             elif tool_name == "data_explorer":
                 return await self.explore_data(kwargs.get('data', ''), kwargs.get('query', ''))
             else:
@@ -147,7 +147,7 @@ class ToolExecutor:
             logger.error(f"Exa search error: {str(e)}")
             return []
     
-    async def execute_code(self, code: str) -> Dict[str, Any]:
+    async def execute_code(self, code: str, output_dir: Optional[str] = None) -> Dict[str, Any]:
         """Execute Python code in a sandboxed environment."""
         if not self.tools_config.get('code_executor', {}).get('enabled', True):
             return {
@@ -174,12 +174,15 @@ class ToolExecutor:
                 temp_file = f.name
             
             try:
+                # Set working directory - use output_dir if provided, otherwise use temp directory
+                working_dir = output_dir if output_dir else tempfile.gettempdir()
+                
                 # Execute the code in a subprocess for sandboxing
                 process = await asyncio.create_subprocess_exec(
                     sys.executable, temp_file,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    cwd=tempfile.gettempdir()
+                    cwd=working_dir
                 )
                 
                 stdout, stderr = await asyncio.wait_for(

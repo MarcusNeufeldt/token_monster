@@ -177,19 +177,22 @@ class SupervisorAgent:
         session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         start_time = asyncio.get_event_loop().time()
         
+        # Create unique output directory for this run
+        run_output_dir = os.path.join(self.logs_dir, f"run_{session_id}")
+        os.makedirs(run_output_dir, exist_ok=True)
+        logger.info(f"Created run output directory: {run_output_dir}")
+        
         logger.info(f"Processing query [Session: {session_id}]: {query[:100]}...")
         
-        # Analyze query complexity and spawning needs
+        # Analyze query complexity for orchestration mode decision
         complexity_analysis = self._analyze_query_complexity(query)
         
-        # Get active agents (base + any spawned agents)
-        active_agents = self._get_active_agents(complexity_analysis)
+        # Start with base agents only - spawning will be plan-driven
+        active_agents = self.workers.copy()
         
-        if complexity_analysis.get('should_spawn_agents', False):
-            spawned_count = len(self.spawned_agents)
-            logger.info(f"Dynamic spawning activated: {spawned_count} specialized agents spawned")
-            for agent in self.spawned_agents:
-                logger.info(f"  - {agent.name}: {agent.agent_config.get('spawned_for', 'Unknown reason')}")
+        # Log complexity analysis for debugging
+        logger.info(f"Query complexity: {complexity_analysis.get('complexity_level', 'unknown')} (score: {complexity_analysis.get('complexity_score', 0)})")
+        logger.info(f"Starting with {len(active_agents)} base agents. Specialized agents will be spawned as needed by the execution plan.")
         
         # Check orchestration mode
         orchestration_mode = self.deliberation_config.get('orchestration_mode', 'parallel')
@@ -197,11 +200,16 @@ class SupervisorAgent:
         
         try:
             if orchestration_mode == 'sequential':
-                # Sequential orchestration with potential spawned agents
-                orchestration_result = await self._orchestrate_sequential_dynamic(query, session_id, enable_critique, active_agents)
+                # Try sequential orchestration with intelligent fallback
+                try:
+                    orchestration_result = await self._orchestrate_sequential_dynamic(query, session_id, enable_critique, active_agents, run_output_dir)
+                except Exception as e:
+                    logger.warning(f"Sequential orchestration failed ({e}), falling back to parallel mode")
+                    orchestration_result = await self._orchestrate_parallel_dynamic(query, session_id, active_agents, run_output_dir)
+                    orchestration_result['orchestration_log']['fallback_reason'] = f"Sequential failed: {str(e)}"
             else:
                 # Enhanced parallel orchestration with spawned agents
-                orchestration_result = await self._orchestrate_parallel_dynamic(query, session_id, active_agents)
+                orchestration_result = await self._orchestrate_parallel_dynamic(query, session_id, active_agents, run_output_dir)
             
             end_time = asyncio.get_event_loop().time()
             processing_time = end_time - start_time
@@ -218,6 +226,7 @@ class SupervisorAgent:
                 'orchestration_mode': orchestration_mode,
                 'complexity_analysis': complexity_analysis,
                 'total_usage': orchestration_result.get('total_usage', {}),
+                'run_output_dir': run_output_dir,
                 'dynamic_spawning': {
                     'enabled': complexity_analysis.get('spawning_enabled', False),
                     'spawned_count': len(self.spawned_agents),
@@ -240,6 +249,9 @@ class SupervisorAgent:
             if self.system_config.get('save_logs', True):
                 await self._save_session_log(result)
             
+            # Generate professional Markdown report
+            await self._generate_markdown_report(result, run_output_dir)
+            
             # Display results
             self._display_results_enhanced(result, verbose)
             
@@ -257,6 +269,7 @@ class SupervisorAgent:
                 'orchestration_log': {},
                 'processing_time': asyncio.get_event_loop().time() - start_time,
                 'complexity_analysis': complexity_analysis,
+                'run_output_dir': run_output_dir,
                 'dynamic_spawning': {
                     'enabled': complexity_analysis.get('spawning_enabled', False),
                     'spawned_count': 0,
@@ -503,7 +516,7 @@ Provide well-researched facts and data that directly address this query.
                     worker_prompt = query
                 
                 task = asyncio.create_task(
-                    self._execute_worker_with_timeout(worker, worker_prompt, session, timeout)
+                    self._execute_worker_with_timeout(worker, worker_prompt, session, timeout, None)
                 )
                 tasks.append(task)
             
@@ -566,7 +579,7 @@ Focus on: accuracy, completeness, and relevance to the query.
 Be concise - provide 2-3 key points for improvement or validation.
 """
                 
-                critique_result = await self._execute_worker_with_timeout(critic, critique_prompt, session, timeout)
+                critique_result = await self._execute_worker_with_timeout(critic, critique_prompt, session, timeout, None)
                 
                 if critique_result['success']:
                     # Quick synthesis with critique
@@ -583,7 +596,7 @@ Create a final, high-quality response that incorporates the best information fro
 Be comprehensive but concise.
 """
                     
-                    synthesis_result = await self._execute_worker_with_timeout(synthesizer, synthesis_prompt, session, timeout)
+                    synthesis_result = await self._execute_worker_with_timeout(synthesizer, synthesis_prompt, session, timeout, None)
                     
                     if synthesis_result['success']:
                         final_response_content = synthesis_result['response']
@@ -637,7 +650,7 @@ Be comprehensive but concise.
                 return worker
         return None
 
-    async def _execute_agent_stage(self, agent: WorkerAgent, prompt: str, session: aiohttp.ClientSession, stage_name: str) -> Dict[str, Any]:
+    async def _execute_agent_stage(self, agent: WorkerAgent, prompt: str, session: aiohttp.ClientSession, stage_name: str, run_output_dir: Optional[str] = None) -> Dict[str, Any]:
         """Execute a specific agent for a stage in the orchestration."""
         logger.info(f"Executing {stage_name} with {agent.name}...")
         
@@ -646,7 +659,7 @@ Be comprehensive but concise.
         
         try:
             result = await asyncio.wait_for(
-                agent.process_task(prompt, session),
+                agent.process_task(prompt, session, run_output_dir),
                 timeout=timeout
             )
             
@@ -708,7 +721,7 @@ Be comprehensive but concise.
             tasks = []
             for worker in active_workers:
                 task = asyncio.create_task(
-                    self._execute_worker_with_timeout(worker, query, session, timeout)
+                    self._execute_worker_with_timeout(worker, query, session, timeout, None)
                 )
                 tasks.append(task)
             
@@ -734,11 +747,11 @@ Be comprehensive but concise.
             return worker_results
     
     async def _execute_worker_with_timeout(self, worker: WorkerAgent, query: str, 
-                                          session: aiohttp.ClientSession, timeout: int) -> Dict[str, Any]:
+                                          session: aiohttp.ClientSession, timeout: int, run_output_dir: Optional[str] = None) -> Dict[str, Any]:
         """Execute a worker with timeout handling."""
         try:
             return await asyncio.wait_for(
-                worker.process_task(query, session), 
+                worker.process_task(query, session, run_output_dir), 
                 timeout=timeout
             )
         except asyncio.TimeoutError:
@@ -1663,30 +1676,56 @@ Provide only the final synthesized response. Do not include meta-commentary abou
             }
         } 
 
-    async def _orchestrate_parallel_dynamic(self, query: str, session_id: str, active_agents: List[WorkerAgent]) -> Dict[str, Any]:
-        """Enhanced parallel orchestration with dynamically spawned specialized agents."""
-        logger.info(f"Using dynamic parallel orchestration with {len(active_agents)} agents...")
+    async def _orchestrate_parallel_dynamic(self, query: str, session_id: str, active_agents: List[WorkerAgent], run_output_dir: str) -> Dict[str, Any]:
+        """Enhanced parallel orchestration with efficient researcher-focused execution."""
+        logger.info(f"Using efficient parallel orchestration with {len(active_agents)} agents...")
         
-        # Separate base agents from spawned agents
-        base_agents = [agent for agent in active_agents if agent not in self.spawned_agents]
-        spawned_agents = [agent for agent in active_agents if agent in self.spawned_agents]
+        # Filter to use suitable agents for parallel execution
+        # Avoid using specialized agents (planner, critic, synthesizer) in parallel mode
+        suitable_agents = []
+        for agent in active_agents:
+            agent_role = agent.agent_config.get('role', 'researcher')
+            # Use agents that are not specialized orchestration roles
+            if agent_role not in ['planner', 'critic', 'synthesizer']:
+                suitable_agents.append(agent)
         
-        if spawned_agents:
-            logger.info(f"Active agents: {len(base_agents)} base + {len(spawned_agents)} spawned")
+        # If no suitable agents, use up to 3 general agents
+        if not suitable_agents:
+            suitable_agents = active_agents[:3]
         
-        # Execute all agents in parallel with specialized prompts
+        # Use multiple agents (at least 2, up to 3 for efficiency)
+        researcher_agents = suitable_agents[:3] if len(suitable_agents) > 1 else suitable_agents
+        
+        # Ensure we have at least 2 agents for meaningful parallel execution
+        if len(researcher_agents) < 2 and len(active_agents) > 1:
+            researcher_agents = active_agents[:3]
+        
+        logger.info(f"Using {len(researcher_agents)} researcher agents for parallel execution")
+        
+        # Execute agents in parallel with generalist research prompts
         worker_results = []
         timeout = self.system_config.get('task_timeout', 120)
         
         async with aiohttp.ClientSession() as session:
-            # Phase 1: Parallel execution of all agents
+            # Phase 1: Parallel execution of researcher agents
             tasks = []
-            for agent in active_agents:
-                # Create specialized prompt based on agent type and focus
-                agent_prompt = self._create_specialized_prompt(query, agent)
+            for i, agent in enumerate(researcher_agents):
+                # Create a generalist research prompt
+                agent_prompt = f"""Original Query: {query}
+
+Your task is to provide a comprehensive research response to this query. You are working as part of a parallel research team, so focus on providing thorough, accurate information that addresses all aspects of the query.
+
+Please:
+1. Gather relevant information using available tools when needed
+2. Provide well-researched, evidence-based responses
+3. Use web search for current information if needed
+4. Execute code for calculations or visualizations if appropriate
+5. Be thorough and comprehensive in your analysis
+
+Respond with a complete analysis that addresses the user's query."""
                 
                 task = asyncio.create_task(
-                    self._execute_worker_with_timeout(agent, agent_prompt, session, timeout)
+                    self._execute_worker_with_timeout(agent, agent_prompt, session, timeout, run_output_dir)
                 )
                 tasks.append(task)
             
@@ -1698,17 +1737,17 @@ Provide only the final synthesized response. Do not include meta-commentary abou
                 if isinstance(result, Exception):
                     worker_results.append({
                         'success': False,
-                        'agent_name': active_agents[i].name,
-                        'model': active_agents[i].model,
+                        'agent_name': researcher_agents[i].name,
+                        'model': researcher_agents[i].model,
                         'response': None,
                         'tool_usage': [],
                         'tool_costs': {},
                         'processing_time': 0,
                         'error': str(result),
-                        'agent_type': 'spawned' if active_agents[i] in spawned_agents else 'base'
+                        'agent_type': 'researcher'
                     })
                 else:
-                    result['agent_type'] = 'spawned' if active_agents[i] in spawned_agents else 'base'
+                    result['agent_type'] = 'researcher'
                     worker_results.append(result)
             
             # Filter successful results
@@ -1717,12 +1756,13 @@ Provide only the final synthesized response. Do not include meta-commentary abou
             if not successful_results:
                 return {
                     'success': False,
-                    'error': 'All agents failed',
+                    'error': 'All research agents failed',
                     'orchestration_log': {
                         'mode': 'parallel_dynamic',
                         'worker_results': worker_results,
                         'total_agents': len(active_agents),
-                        'spawned_agents': len(spawned_agents)
+                        'researcher_agents': len(researcher_agents),
+                        'execution_strategy': 'efficient_parallel_research'
                     }
                 }
             
@@ -1739,9 +1779,9 @@ Provide only the final synthesized response. Do not include meta-commentary abou
                     'mode': 'parallel_dynamic',
                     'worker_results': worker_results,
                     'total_agents': len(active_agents),
-                    'base_agents': len(base_agents),
-                    'spawned_agents': len(spawned_agents),
-                    'synthesis_method': 'dynamic_specialization'
+                    'researcher_agents': len(researcher_agents),
+                    'execution_strategy': 'efficient_parallel_research',
+                    'synthesis_method': 'llm_based_synthesis'
                 },
                 'total_usage': total_usage
             }
@@ -1789,6 +1829,13 @@ Focus exclusively on "{focus_area}" and provide comprehensive regional insights 
 4. Create clear, well-documented code with explanations
 5. If visualization is needed, generate appropriate charts or graphs
 
+CRITICAL CODING REQUIREMENTS:
+- NEVER use plt.show() in your code - it will cause the system to hang
+- Instead, save all plots to files using plt.savefig('descriptive_filename.png')
+- Always use descriptive filenames like 'gdp_comparison.png' or 'population_trends.png'
+- You MUST report the exact filename of any saved artifacts in your text response
+- Example: "I have created a bar chart and saved it as 'gdp_comparison.png'"
+
 Focus on the technical and computational aspects of this query. Write and execute code to provide concrete, calculated results."""
 
         elif role == 'researcher':
@@ -1822,50 +1869,49 @@ Focus on delivering accurate, helpful information that addresses the user's need
         return base_prompt + specialized_prompt
 
     async def _synthesize_dynamic_results(self, successful_results: List[Dict[str, Any]], query: str) -> str:
-        """Intelligently synthesize results from dynamically spawned specialized agents."""
+        """Intelligently synthesize results from multiple agents using a dedicated synthesis LLM call."""
+        if not successful_results:
+            return "No successful agent responses were generated."
         if len(successful_results) == 1:
             return successful_results[0]['response']
+
+        logger.info(f"Synthesizing {len(successful_results)} results with a dedicated synthesizer agent.")
         
-        # Categorize results by agent type and specialization
-        comparative_results = []
-        geographic_results = []
-        coding_results = []
-        general_results = []
+        # Format the inputs for the synthesizer
+        synthesis_inputs = []
+        for i, result in enumerate(successful_results):
+            agent_name = result.get('agent_name', f'Agent {i+1}')
+            response = result.get('response', '')
+            synthesis_inputs.append(f"--- {agent_name} Response ---\n{response}\n")
         
-        for result in successful_results:
-            agent_name = result['agent_name']
-            response = result['response']
+        synthesis_prompt = f"""You are a master synthesizer. Your job is to analyze responses from multiple AI agents and create a single, coherent, and high-quality final answer that addresses the user's original query.
+
+Original User Query: "{query}"
+
+Here are the raw responses from the individual agents:
+{''.join(synthesis_inputs)}
+---
+Your Task: Synthesize these responses into the best possible single answer. Remove redundancies, reconcile conflicts, and present the information logically. Create a comprehensive, well-structured response that addresses all aspects of the user's query.
+
+Produce the final, synthesized response below:"""
+        
+        try:
+            # Use a high-quality model for synthesis
+            synthesis_model = self.deliberation_config.get('synthesis_model', 'openai/gpt-4o')
+            synthesis_result = await self._call_synthesis_llm(synthesis_prompt, synthesis_model)
             
-            if 'comparative_researcher' in agent_name:
-                comparative_results.append(f"Comparative Analysis: {response}")
-            elif 'geographic_researcher' in agent_name:
-                geographic_results.append(f"Geographic Analysis: {response}")
-            elif 'coder_specialist' in agent_name:
-                coding_results.append(f"Technical Analysis: {response}")
+            if synthesis_result and synthesis_result.get('success'):
+                return synthesis_result['result']
             else:
-                general_results.append(f"General Analysis: {response}")
-        
-        # Combine results intelligently
-        synthesized_parts = []
-        
-        if comparative_results:
-            synthesized_parts.append("## Comparative Analysis\n" + "\n\n".join(comparative_results))
-        
-        if geographic_results:
-            synthesized_parts.append("## Regional Perspectives\n" + "\n\n".join(geographic_results))
-        
-        if coding_results:
-            synthesized_parts.append("## Technical Implementation\n" + "\n\n".join(coding_results))
-        
-        if general_results:
-            synthesized_parts.append("## Comprehensive Analysis\n" + "\n\n".join(general_results))
-        
-        if len(synthesized_parts) > 1:
-            final_response = f"# Comprehensive Response to: {query}\n\n" + "\n\n".join(synthesized_parts)
-        else:
-            final_response = synthesized_parts[0] if synthesized_parts else successful_results[0]['response']
-        
-        return final_response
+                logger.warning("Synthesis LLM call failed. Falling back to the longest individual response.")
+                return max(successful_results, key=lambda r: len(r.get('response', ''))).get('response', "Synthesis failed.")
+                
+        except Exception as e:
+            logger.error(f"Synthesis error: {e}")
+            logger.warning("Falling back to simple concatenation due to synthesis failure.")
+            # Simple fallback - return the longest response
+            return max(successful_results, key=lambda r: len(r.get('response', ''))).get('response', "Synthesis failed.")
+
 
     async def _execute_intelligent_planning(self, planner: WorkerAgent, query: str, session: aiohttp.ClientSession) -> Dict[str, Any]:
         """Execute intelligent planning stage with JSON output."""
@@ -1884,8 +1930,16 @@ The plan should consist of 'stages'. Each stage needs:
 - 'prompt': The specific instruction for the agent in this stage
 - 'agent_template': MUST be one of: "comparative_researcher", "geographic_researcher", "coder_specialist", "synthesizer"
 - 'focus_area': The specific topic for this agent (e.g., "US Policy")
-- 'dependencies': A list of 'stage_id's that must be completed before this stage can start. Use [] for initial stages.
-- 'synthesis_input': boolean, if true, the output will be fed into the final synthesis
+- 'dependencies': A JSON array of strings (e.g., ["stage_a", "stage_b"]). Use [] for initial stages.
+- 'synthesis_input': A boolean value (true or false, without quotes)
+
+CRITICAL FORMATTING REQUIREMENTS:
+- The 'dependencies' field MUST be a JSON array of strings (e.g., ["stage_a", "stage_b"])
+- The 'synthesis_input' field MUST be a boolean (true or false, without quotes)
+- Your entire response MUST be a single, valid JSON object
+- Do not add any text before or after the JSON
+- DO NOT escape any characters, especially quotes or brackets (no backslashes!)
+- Use normal JSON syntax without any escaping
 
 VALID AGENT TEMPLATES:
 - "comparative_researcher": For comparing subjects or gathering focused research
@@ -1893,7 +1947,7 @@ VALID AGENT TEMPLATES:
 - "coder_specialist": For coding, calculations, and visualizations
 - "synthesizer": For final synthesis and comprehensive responses
 
-Example JSON format:
+Example of a PERFECT response format:
 {{
   "plan": [
     {{ "stage_id": "research_us", "prompt": "Research US policy on X", "agent_template": "comparative_researcher", "focus_area": "US", "dependencies": [], "synthesis_input": true }},
@@ -1902,81 +1956,141 @@ Example JSON format:
   ]
 }}
 
-Now generate the JSON execution plan for the query. Respond with ONLY the JSON, no additional text."""
+Now generate the JSON execution plan for the query. Respond with ONLY the JSON."""
         
-        return await self._execute_agent_stage(planner, planning_prompt, session, "Intelligent Planning")
+        return await self._execute_agent_stage(planner, planning_prompt, session, "Intelligent Planning", None)
 
-    def _parse_execution_plan(self, planning_response: str) -> Dict[str, Any]:
-        """Parse the JSON execution plan from the planner's response."""
+    def _parse_execution_plan(self, planning_response: str) -> Optional[Dict[str, Any]]:
+        """
+        Robustly parse the JSON execution plan from the planner's response,
+        with self-correction capabilities.
+        """
         import json
         import re
         
-        try:
-            # Clean the response to extract JSON
-            cleaned_response = planning_response.strip()
-            
-            # Try to find JSON in the response using better regex
-            json_match = re.search(r'\{.*?"plan".*?\[.*?\].*?\}', cleaned_response, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(0)
-            else:
-                # Try to extract everything between first { and last }
-                start_idx = cleaned_response.find('{')
-                end_idx = cleaned_response.rfind('}')
-                if start_idx != -1 and end_idx != -1:
-                    json_str = cleaned_response[start_idx:end_idx+1]
-                else:
-                    json_str = cleaned_response
-            
-            # Clean up common JSON issues
-            json_str = json_str.replace('\n', ' ').replace('\t', ' ')
-            # Fix trailing commas
-            json_str = re.sub(r',\s*}', '}', json_str)
-            json_str = re.sub(r',\s*]', ']', json_str)
-            
-            # Parse JSON
-            plan = json.loads(json_str)
-            
-            # Validate plan structure
-            if not isinstance(plan, dict) or 'plan' not in plan:
-                logger.warning("Invalid plan structure - missing 'plan' key")
-                return None
-            
-            # Validate each stage
-            valid_templates = ['comparative_researcher', 'geographic_researcher', 'coder_specialist', 'synthesizer']
-            for stage in plan['plan']:
-                required_fields = ['stage_id', 'prompt', 'agent_template', 'focus_area', 'dependencies', 'synthesis_input']
-                if not all(field in stage for field in required_fields):
-                    logger.warning(f"Invalid stage structure: {stage}")
+        logger.info("Parsing execution plan with robust JSON parser...")
+        
+        # DIAGNOSTIC: Log the raw response first
+        logger.debug(f"RAW PLANNER RESPONSE:\n{'-'*60}\n{planning_response}\n{'-'*60}")
+        
+        # 1. Extract the JSON block from the response
+        # LLMs often wrap JSON in ```json ... ``` or other text.
+        json_match = re.search(r'\{.*"plan".*\}', planning_response, re.DOTALL)
+        if not json_match:
+            logger.error("Could not find a JSON object in the planner's response.")
+            logger.debug(f"Full response was: {planning_response}")
+            return None
+        
+        json_str = json_match.group(0)
+        logger.debug(f"EXTRACTED JSON STRING:\n{'-'*60}\n{json_str}\n{'-'*60}")
+        
+        # 2. Attempt to parse, with a retry loop for self-correction
+        for attempt in range(3):  # Try to fix and parse up to 3 times
+            try:
+                # Basic cleaning
+                json_str = json_str.strip()
+                # LLMs sometimes add trailing commas before '}' or ']'. This is invalid JSON.
+                json_str = re.sub(r',\s*([\}\]])', r'\1', json_str)
+                # Remove newlines and tabs that might break JSON
+                json_str = re.sub(r'\n\s*', ' ', json_str)
+                json_str = re.sub(r'\t', ' ', json_str)
+                # Fix multiple spaces
+                json_str = re.sub(r'\s+', ' ', json_str)
+                
+                plan = json.loads(json_str)
+                
+                # 3. Validate the parsed structure
+                if not isinstance(plan, dict) or 'plan' not in plan or not isinstance(plan['plan'], list):
+                    logger.warning("Invalid plan structure received from planner.")
                     return None
                 
-                # Validate agent template
-                if stage['agent_template'] not in valid_templates:
-                    logger.warning(f"Invalid agent template '{stage['agent_template']}' in stage {stage['stage_id']}")
-                    # Try to fix common template names
-                    template_mapping = {
-                        'data_researcher': 'comparative_researcher',
-                        'comparative_analyst': 'comparative_researcher',
-                        'visualization_specialist': 'coder_specialist',
-                        'researcher': 'comparative_researcher'
-                    }
-                    if stage['agent_template'] in template_mapping:
-                        stage['agent_template'] = template_mapping[stage['agent_template']]
-                        logger.info(f"Fixed agent template to: {stage['agent_template']}")
-                    else:
-                        logger.error(f"Cannot fix invalid agent template: {stage['agent_template']}")
+                # 4. Validate each stage and fix common issues
+                valid_templates = ['comparative_researcher', 'geographic_researcher', 'coder_specialist', 'synthesizer']
+                template_mapping = {
+                    'data_researcher': 'comparative_researcher',
+                    'comparative_analyst': 'comparative_researcher',
+                    'visualization_specialist': 'coder_specialist',
+                    'researcher': 'comparative_researcher'
+                }
+                
+                for stage in plan['plan']:
+                    required_fields = ['stage_id', 'prompt', 'agent_template', 'focus_area', 'dependencies', 'synthesis_input']
+                    if not all(field in stage for field in required_fields):
+                        logger.warning(f"Invalid stage structure: {stage}")
                         return None
-            
-            logger.info(f"Successfully parsed execution plan with {len(plan['plan'])} stages")
-            return plan
-            
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse JSON plan: {e}")
-            logger.error(f"Response was: {planning_response}")
-            return None
-        except Exception as e:
-            logger.error(f"Error parsing execution plan: {e}")
-            return None
+                    
+                    # Validate and fix agent template
+                    if stage['agent_template'] not in valid_templates:
+                        logger.warning(f"Invalid agent template '{stage['agent_template']}' in stage {stage['stage_id']}")
+                        if stage['agent_template'] in template_mapping:
+                            stage['agent_template'] = template_mapping[stage['agent_template']]
+                            logger.info(f"Fixed agent template to: {stage['agent_template']}")
+                        else:
+                            logger.error(f"Cannot fix invalid agent template: {stage['agent_template']}")
+                            return None
+                
+                logger.info(f"Successfully parsed execution plan on attempt {attempt + 1} with {len(plan['plan'])} stages")
+                return plan
+                
+            except json.JSONDecodeError as e:
+                logger.warning(f"JSON parsing failed on attempt {attempt + 1}: {e}")
+                if attempt < 2:
+                    logger.info("Attempting to self-correct the invalid JSON...")
+                    # Try more aggressive JSON cleaning
+                    json_str = self._clean_json_aggressively(json_str)
+                    logger.debug(f"CLEANED JSON STRING (attempt {attempt+1}):\n{'-'*60}\n{json_str}\n{'-'*60}")
+                else:
+                    logger.error("Could not parse JSON plan after multiple correction attempts.")
+                    logger.error(f"Final JSON attempt was: {json_str}")
+                    return None
+            except Exception as e:
+                logger.error(f"Unexpected error during JSON parsing: {e}")
+                return None
+        
+        return None
+    
+    def _clean_json_aggressively(self, json_str: str) -> str:
+        """Apply aggressive JSON cleaning for malformed responses."""
+        import re
+        
+        # Remove common LLM artifacts
+        json_str = re.sub(r'```json\s*', '', json_str)
+        json_str = re.sub(r'```\s*', '', json_str)
+        
+        # FIX: Remove erroneous backslashes that cause "Invalid \escape" errors
+        # This addresses the specific issue where LLMs add backslashes before quotes and brackets
+        json_str = json_str.replace(r'\"', '"')  # Remove escaped quotes
+        json_str = json_str.replace(r'\[', '[')  # Remove escaped left brackets
+        json_str = json_str.replace(r'\]', ']')  # Remove escaped right brackets
+        json_str = json_str.replace(r'\{', '{')  # Remove escaped left braces
+        json_str = json_str.replace(r'\}', '}')  # Remove escaped right braces
+        
+        # Remove trailing commas (common JSON error)
+        json_str = re.sub(r',\s*([\}\]])', r'\1', json_str)
+        
+        # Fix common quote issues
+        json_str = re.sub(r'([{,]\s*)"?([^":\s]+)"?\s*:', r'\1"\2":', json_str)
+        
+        # Fix string-wrapped arrays (e.g., "dependencies": " []" -> "dependencies": [])
+        json_str = re.sub(r'(?<!\\)"\s*:\s*"\s*\[(.*?)\]\s*"', r'":\[\1\]', json_str)
+        
+        # Fix string-wrapped booleans (e.g., "synthesis_input": "true" -> "synthesis_input": true)
+        json_str = re.sub(r'(?<!\\)"\s*:\s*"\s*(true|false)\s*"', r'":\1', json_str)
+        
+        # Fix quoted boolean values - remove quotes around true/false
+        json_str = re.sub(r':\s*"(true|false)"\s*', r': \1', json_str)
+        
+        # Fix quoted array values - remove quotes around array syntax
+        json_str = re.sub(r':\s*"\s*\[([^\]]*?)\]\s*"\s*', r': [\1]', json_str)
+        
+        # Fix boolean values
+        json_str = re.sub(r':\s*true\s*', ': true', json_str)
+        json_str = re.sub(r':\s*false\s*', ': false', json_str)
+        
+        # Ensure proper string quoting for non-boolean, non-array values
+        json_str = re.sub(r':\s*([^",\[\{][^",\]\}]*[^",\[\{])\s*([,\]\}])', r': "\1"\2', json_str)
+        
+        return json_str
 
     def _display_execution_plan(self, execution_plan: Dict[str, Any]) -> None:
         """Display the execution plan to the user."""
@@ -2003,7 +2117,7 @@ Now generate the JSON execution plan for the query. Respond with ONLY the JSON, 
         print("-" * 60)
         print()
 
-    async def _execute_dynamic_plan(self, execution_plan: Dict[str, Any], query: str, active_agents: List[WorkerAgent], session: aiohttp.ClientSession) -> Dict[str, Any]:
+    async def _execute_dynamic_plan(self, execution_plan: Dict[str, Any], query: str, active_agents: List[WorkerAgent], session: aiohttp.ClientSession, run_output_dir: str) -> Dict[str, Any]:
         """Execute the dynamic plan with dependency management."""
         plan_stages = execution_plan['plan']
         completed_stages = []
@@ -2045,7 +2159,7 @@ Now generate the JSON execution plan for the query. Respond with ONLY the JSON, 
             # Create tasks for parallel execution
             tasks = []
             for stage in ready_stages:
-                task = asyncio.create_task(self._execute_plan_stage(stage, query, stage_outputs, active_agents, session))
+                task = asyncio.create_task(self._execute_plan_stage(stage, query, stage_outputs, active_agents, session, run_output_dir))
                 tasks.append((stage, task))
             
             # Wait for all tasks to complete
@@ -2104,7 +2218,7 @@ Now generate the JSON execution plan for the query. Respond with ONLY the JSON, 
             'stage_results': stage_results
         }
 
-    async def _execute_plan_stage(self, stage: Dict[str, Any], query: str, stage_outputs: Dict[str, str], active_agents: List[WorkerAgent], session: aiohttp.ClientSession) -> Dict[str, Any]:
+    async def _execute_plan_stage(self, stage: Dict[str, Any], query: str, stage_outputs: Dict[str, str], active_agents: List[WorkerAgent], session: aiohttp.ClientSession, run_output_dir: str) -> Dict[str, Any]:
         """Execute a single stage of the dynamic plan."""
         stage_id = stage['stage_id']
         agent_template = stage['agent_template']
@@ -2142,13 +2256,22 @@ Now generate the JSON execution plan for the query. Respond with ONLY the JSON, 
         elif agent_template == "comparative_researcher":
             full_prompt += f"As a Comparative Researcher focusing on '{focus_area}', provide detailed analysis and research specifically about this subject."
         elif agent_template == "coder_specialist":
-            full_prompt += "As a Coding Specialist, write and execute Python code to address any computational requirements. Use the code_executor tool as needed."
+            full_prompt += """As a Coding Specialist, write and execute Python code to address any computational requirements. Use the code_executor tool as needed.
+
+CRITICAL CODING REQUIREMENTS:
+- NEVER use plt.show() in your code - it will cause the system to hang
+- Instead, save all plots to files using plt.savefig('descriptive_filename.png')
+- Always use descriptive filenames like 'gdp_comparison.png' or 'population_trends.png'
+- You MUST report the exact filename of any saved artifacts in your text response
+- Example: "I have created a bar chart and saved it as 'gdp_comparison.png'"
+
+IMPORTANT: When generating plots or saving files, use descriptive filenames like 'gdp_comparison.png' or 'data_analysis.csv'. When you save a file, mention the exact filename in your response (e.g., "Chart saved as 'gdp_comparison.png'")."""
         else:
             full_prompt += f"Focus your expertise on '{focus_area}' and provide high-quality analysis."
         
         # Execute the stage
         try:
-            result = await self._execute_agent_stage(agent, full_prompt, session, f"Stage: {stage_id}")
+            result = await self._execute_agent_stage(agent, full_prompt, session, f"Stage: {stage_id}", run_output_dir)
             result['stage_id'] = stage_id
             result['agent_template'] = agent_template
             result['focus_area'] = focus_area
@@ -2188,8 +2311,108 @@ Now generate the JSON execution plan for the query. Respond with ONLY the JSON, 
             logger.warning(f"Using fallback agent for template {agent_template}")
             return active_agents[0]
         
-        return None 
-    async def _orchestrate_sequential_dynamic(self, query: str, session_id: str, enable_critique: bool, active_agents: List[WorkerAgent]) -> Dict[str, Any]:
+        return None
+    
+    async def _generate_markdown_report(self, result: Dict[str, Any], output_dir: str) -> None:
+        """Generate a professional Markdown report for the query execution."""
+        report_path = os.path.join(output_dir, "final_report.md")
+        
+        try:
+            with open(report_path, "w", encoding="utf-8") as f:
+                f.write(f"# Grok Heavy: Analysis Report\\n\\n")
+                f.write(f"**Query:** `{result['query']}`\\n")
+                f.write(f"**Session ID:** `{result['session_id']}`\\n")
+                f.write(f"**Execution Time:** {result['processing_time']:.2f} seconds\\n")
+                f.write(f"**Orchestration Mode:** {result['orchestration_mode']}\\n\\n")
+                f.write("---\\n\\n")
+                
+                # Add fallback information if applicable
+                orchestration_log = result.get('orchestration_log', {})
+                if orchestration_log.get('fallback_reason'):
+                    f.write(f"⚠️ **Note:** System switched to fallback mode due to: {orchestration_log['fallback_reason']}\\n\\n")
+                
+                # Main response
+                f.write("## Executive Summary\\n\\n")
+                final_response = result.get('final_response', "No final response was generated.")
+                f.write(final_response)
+                f.write("\\n\\n")
+                
+                # Execution details
+                orchestration_log = result.get('orchestration_log', {})
+                if orchestration_log.get('mode') == 'sequential_dynamic':
+                    f.write("## Execution Plan\\n\\n")
+                    plan = orchestration_log.get('plan', {})
+                    if plan and 'plan' in plan:
+                        for i, stage in enumerate(plan['plan'], 1):
+                            f.write(f"**Stage {i}:** {stage['stage_id']} ({stage['agent_template']})\\n")
+                            f.write(f"- Focus: {stage['focus_area']}\\n")
+                            if stage['dependencies']:
+                                f.write(f"- Dependencies: {', '.join(stage['dependencies'])}\\n")
+                            f.write("\\n")
+                    f.write("\\n")
+                
+                # Look for generated artifacts
+                f.write("## Generated Artifacts\\n\\n")
+                artifacts_found = False
+                
+                # Check for files in the output directory
+                try:
+                    for filename in os.listdir(output_dir):
+                        if filename.endswith(('.png', '.jpg', '.jpeg', '.svg', '.pdf')):
+                            f.write(f"### {filename}\\n\\n")
+                            f.write(f"![{filename}](./{filename})\\n\\n")
+                            artifacts_found = True
+                        elif filename.endswith(('.py', '.csv', '.json', '.txt')) and filename != 'final_report.md':
+                            f.write(f"### {filename}\\n\\n")
+                            f.write(f"[Download {filename}](./{filename})\\n\\n")
+                            artifacts_found = True
+                except Exception as e:
+                    logger.warning(f"Error listing artifacts: {e}")
+                
+                if not artifacts_found:
+                    f.write("No visual artifacts were generated for this run.\\n\\n")
+                
+                # Performance metrics
+                f.write("## Performance Metrics\\n\\n")
+                total_usage = result.get('total_usage', {})
+                if total_usage:
+                    costs = total_usage.get('costs', {})
+                    f.write(f"- **Total Cost:** ${costs.get('total_cost', 0):.6f}\\n")
+                    f.write(f"- **Total Tokens:** {total_usage.get('total_tokens', 0):,}\\n")
+                    f.write(f"- **Agents Used:** {total_usage.get('agents_used', 0)}\\n")
+                    f.write(f"- **Processing Time:** {result['processing_time']:.2f} seconds\\n")
+                    
+                    # Add efficiency metrics
+                    orchestration_log = result.get('orchestration_log', {})
+                    if orchestration_log.get('mode') == 'parallel_dynamic':
+                        researcher_count = orchestration_log.get('researcher_agents', 0)
+                        f.write(f"- **Parallel Researchers:** {researcher_count}\\n")
+                        f.write(f"- **Execution Strategy:** {orchestration_log.get('execution_strategy', 'standard')}\\n")
+                        f.write(f"- **Synthesis Method:** {orchestration_log.get('synthesis_method', 'simple')}\\n")
+                else:
+                    f.write("No performance metrics available.\\n")
+                
+                # Dynamic spawning info
+                spawning_info = result.get('dynamic_spawning', {})
+                if spawning_info.get('spawned_count', 0) > 0:
+                    f.write("\\n## Dynamic Agent Spawning\\n\\n")
+                    f.write(f"**Spawned Agents:** {spawning_info['spawned_count']}\\n\\n")
+                    for agent in spawning_info['spawned_agents']:
+                        f.write(f"- **{agent['name']}:** {agent['specialization']} (Focus: {agent['focus_area']})\\n")
+                
+                f.write("\\n---\\n\\n")
+                f.write("*Report generated by Grok Heavy Dynamic Orchestrator*\\n")
+            
+            print("\\n" + "="*80)
+            print("REPORT GENERATION COMPLETE")
+            print("="*80)
+            print(f"A detailed Markdown report has been saved to: {report_path}")
+            print("="*80)
+            
+        except Exception as e:
+            logger.error(f"Failed to generate Markdown report: {e}")
+    
+    async def _orchestrate_sequential_dynamic(self, query: str, session_id: str, enable_critique: bool, active_agents: List[WorkerAgent], run_output_dir: str) -> Dict[str, Any]:
         """Advanced sequential orchestration with dynamic planning and execution."""
         logger.info("Starting dynamic sequential orchestration with intelligent planning...")
         
@@ -2213,30 +2436,45 @@ Now generate the JSON execution plan for the query. Respond with ONLY the JSON, 
                 
                 if not planning_result['success']:
                     logger.error("Planning stage failed, falling back to parallel mode")
-                    return await self._orchestrate_parallel_dynamic(query, session_id, active_agents)
+                    fallback_result = await self._orchestrate_parallel_dynamic(query, session_id, active_agents, run_output_dir)
+                    fallback_result['orchestration_log']['fallback_reason'] = "Planning stage failed"
+                    return fallback_result
                 
-                # Parse the execution plan
-                execution_plan = self._parse_execution_plan(planning_result['response'])
-                orchestration_log['plan'] = execution_plan
-                
-                if not execution_plan or not execution_plan.get('plan'):
-                    logger.warning("No valid execution plan received, falling back to parallel mode")
-                    return await self._orchestrate_parallel_dynamic(query, session_id, active_agents)
+                # Parse the execution plan with enhanced error handling
+                try:
+                    execution_plan = self._parse_execution_plan(planning_result['response'])
+                    orchestration_log['plan'] = execution_plan
+                    
+                    if not execution_plan or not execution_plan.get('plan'):
+                        logger.warning("No valid execution plan received, falling back to parallel mode")
+                        fallback_result = await self._orchestrate_parallel_dynamic(query, session_id, active_agents, run_output_dir)
+                        fallback_result['orchestration_log']['fallback_reason'] = "Invalid execution plan"
+                        return fallback_result
+                except Exception as e:
+                    logger.error(f"Execution plan parsing failed: {e}, falling back to parallel mode")
+                    fallback_result = await self._orchestrate_parallel_dynamic(query, session_id, active_agents, run_output_dir)
+                    fallback_result['orchestration_log']['fallback_reason'] = f"Plan parsing failed: {str(e)}"
+                    return fallback_result
                 
                 # Stage 2: Execute the Plan
                 logger.info(f"Stage 2: Executing Dynamic Plan ({len(execution_plan['plan'])} stages)...")
                 self._display_execution_plan(execution_plan)
                 
-                plan_execution_result = await self._execute_dynamic_plan(execution_plan, query, active_agents, session)
-                orchestration_log['plan_execution'] = plan_execution_result['execution_log']
-                orchestration_log['stages'].extend(plan_execution_result['stage_results'])
-                
-                if not plan_execution_result['success']:
-                    return {
-                        'success': False,
-                        'error': plan_execution_result['error'],
-                        'orchestration_log': orchestration_log
-                    }
+                try:
+                    plan_execution_result = await self._execute_dynamic_plan(execution_plan, query, active_agents, session, run_output_dir)
+                    orchestration_log['plan_execution'] = plan_execution_result['execution_log']
+                    orchestration_log['stages'].extend(plan_execution_result['stage_results'])
+                    
+                    if not plan_execution_result['success']:
+                        logger.warning(f"Plan execution failed: {plan_execution_result['error']}, falling back to parallel mode")
+                        fallback_result = await self._orchestrate_parallel_dynamic(query, session_id, active_agents, run_output_dir)
+                        fallback_result['orchestration_log']['fallback_reason'] = f"Plan execution failed: {plan_execution_result['error']}"
+                        return fallback_result
+                except Exception as e:
+                    logger.error(f"Plan execution encountered error: {e}, falling back to parallel mode")
+                    fallback_result = await self._orchestrate_parallel_dynamic(query, session_id, active_agents, run_output_dir)
+                    fallback_result['orchestration_log']['fallback_reason'] = f"Plan execution error: {str(e)}"
+                    return fallback_result
                 
                 # Get the final response from the plan execution
                 final_response = plan_execution_result['final_response']

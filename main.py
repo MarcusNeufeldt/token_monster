@@ -13,15 +13,26 @@ import yaml
 from dotenv import load_dotenv
 from supervisor import SupervisorAgent
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('grok_heavy.log')
-    ]
-)
+# Setup logging function - will be called with dynamic level
+def setup_logging(level_name: str = 'INFO'):
+    """Setup logging with the specified level."""
+    log_level = getattr(logging, level_name.upper(), logging.INFO)
+    
+    # Remove all handlers to avoid duplicate logs
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+    
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('grok_heavy.log', mode='w')  # Overwrite log each run
+        ]
+    )
+
+# Initial setup with INFO level (will be overridden by argparse)
+setup_logging('INFO')
 
 logger = logging.getLogger(__name__)
 
@@ -114,8 +125,8 @@ async def main():
     parser = setup_argparse()
     args = parser.parse_args()
     
-    # Configure logging level
-    logging.getLogger().setLevel(getattr(logging, args.log_level))
+    # Configure logging level with proper setup
+    setup_logging(args.log_level)
     
     # Load configuration and API key
     config = load_config(args.config)

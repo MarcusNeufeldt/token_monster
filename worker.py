@@ -37,7 +37,7 @@ class WorkerAgent:
                 return agent
         return {}
         
-    async def process_task(self, prompt: str, session: aiohttp.ClientSession) -> Dict[str, Any]:
+    async def process_task(self, prompt: str, session: aiohttp.ClientSession, output_dir: Optional[str] = None) -> Dict[str, Any]:
         """Process a task and return the result with tool usage logs."""
         start_time = asyncio.get_event_loop().time()
         
@@ -48,7 +48,7 @@ class WorkerAgent:
                 return response
             
             # Check for tool usage and handle iteratively
-            final_response = await self._handle_tool_usage(response['result'], session)
+            final_response = await self._handle_tool_usage(response['result'], session, output_dir)
             
             end_time = asyncio.get_event_loop().time()
             
@@ -75,7 +75,7 @@ class WorkerAgent:
                 'error': str(e)
             }
     
-    async def _handle_tool_usage(self, initial_response: str, session: aiohttp.ClientSession) -> Dict[str, Any]:
+    async def _handle_tool_usage(self, initial_response: str, session: aiohttp.ClientSession, output_dir: Optional[str] = None) -> Dict[str, Any]:
         """Handle tool usage in an iterative manner."""
         current_response = initial_response
         tool_usage_log = []
@@ -95,6 +95,10 @@ class WorkerAgent:
             for tool_request in tool_requests:
                 tool_name = tool_request['tool']
                 tool_args = tool_request['args']
+                
+                # Add output directory for code execution
+                if tool_name == 'code_executor' and output_dir:
+                    tool_args['output_dir'] = output_dir
                 
                 result = await self.tool_executor.execute_tool(tool_name, **tool_args)
                 tool_results.append({
@@ -409,6 +413,30 @@ Your approach should be:
 - Complete in providing actionable information
 
 Focus on creating responses that are both informative and accessible to the user."""
+
+        elif agent_role == 'coder_specialist':
+            role_prompt = f"""
+YOUR ROLE: Coding and Visualization Specialist
+
+Your primary responsibilities:
+1. Analyze queries for computational or coding requirements
+2. Write clean, efficient Python code to perform calculations, data processing, or visualizations
+3. Use the code_executor tool to run and validate your code
+4. Create clear, well-documented code with explanations
+5. Generate appropriate charts, graphs, or other visualizations
+
+CRITICAL CODING REQUIREMENTS:
+- NEVER use plt.show() in your code - it will cause the system to hang
+- Instead, save all plots to files using plt.savefig('descriptive_filename.png')
+- Always use descriptive filenames like 'gdp_comparison.png' or 'population_trends.png'
+- You MUST report the exact filename of any saved artifacts in your text response
+- Example: "I have created a bar chart and saved it as 'gdp_comparison.png'"
+
+Your approach should be:
+- Methodical in breaking down computational problems
+- Clean and well-commented in your code
+- Careful to handle edge cases and potential errors
+- Explicit in documenting what files you create"""
 
         else:
             # Fallback for generalist or unknown roles
