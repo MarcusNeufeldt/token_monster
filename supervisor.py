@@ -924,7 +924,7 @@ Provide only the final synthesized response. Do not include meta-commentary abou
                     cost_parts.append(f"{tool_usage['data_analyses']} analyses")
                 
                 tools_info = f", {', '.join(cost_parts)}" if cost_parts else ""
-                print(f"\n💰 Query Cost: ${total_cost:.6f} ({agents_used} agent{'s' if agents_used != 1 else ''}, {result['total_usage'].get('total_tokens', 0):,} tokens{tools_info})")
+                print(f"\nQuery Cost: ${total_cost:.6f} ({agents_used} agent{'s' if agents_used != 1 else ''}, {result['total_usage'].get('total_tokens', 0):,} tokens{tools_info})")
             
             if verbose:
                 print("\n" + "-"*60)
@@ -1399,7 +1399,7 @@ Provide only the final synthesized response. Do not include meta-commentary abou
                 
                 tools_info = f", {', '.join(cost_parts)}" if cost_parts else ""
                 orchestration_mode = result.get('orchestration_mode', 'unknown')
-                print(f"\n💰 Query Cost: ${total_cost:.6f} ({orchestration_mode} mode, {stages_completed} stages, {result['total_usage'].get('total_tokens', 0):,} tokens{tools_info})")
+                print(f"\nQuery Cost: ${total_cost:.6f} ({orchestration_mode} mode, {stages_completed} stages, {result['total_usage'].get('total_tokens', 0):,} tokens{tools_info})")
             
             if verbose:
                 print("\n" + "-"*60)
@@ -1865,8 +1865,396 @@ Focus on delivering accurate, helpful information that addresses the user's need
         else:
             final_response = synthesized_parts[0] if synthesized_parts else successful_results[0]['response']
         
-        return final_response 
+        return final_response
+
+    async def _execute_intelligent_planning(self, planner: WorkerAgent, query: str, session: aiohttp.ClientSession) -> Dict[str, Any]:
+        """Execute intelligent planning stage with JSON output."""
+        planning_prompt = f"""You are a Master Planner AI that creates structured execution plans for complex queries.
+
+Query: "{query}"
+
+Analyze this query and create a step-by-step execution plan in JSON format. Consider:
+1. What information needs to be gathered
+2. What specialized agents are needed
+3. Dependencies between tasks
+4. Final synthesis requirements
+
+The plan should consist of 'stages'. Each stage needs:
+- 'stage_id': A unique identifier (e.g., "research_us_policy")
+- 'prompt': The specific instruction for the agent in this stage
+- 'agent_template': MUST be one of: "comparative_researcher", "geographic_researcher", "coder_specialist", "synthesizer"
+- 'focus_area': The specific topic for this agent (e.g., "US Policy")
+- 'dependencies': A list of 'stage_id's that must be completed before this stage can start. Use [] for initial stages.
+- 'synthesis_input': boolean, if true, the output will be fed into the final synthesis
+
+VALID AGENT TEMPLATES:
+- "comparative_researcher": For comparing subjects or gathering focused research
+- "geographic_researcher": For region-specific analysis
+- "coder_specialist": For coding, calculations, and visualizations
+- "synthesizer": For final synthesis and comprehensive responses
+
+Example JSON format:
+{{
+  "plan": [
+    {{ "stage_id": "research_us", "prompt": "Research US policy on X", "agent_template": "comparative_researcher", "focus_area": "US", "dependencies": [], "synthesis_input": true }},
+    {{ "stage_id": "research_cn", "prompt": "Research China policy on X", "agent_template": "comparative_researcher", "focus_area": "China", "dependencies": [], "synthesis_input": true }},
+    {{ "stage_id": "final_synthesis", "prompt": "Synthesize the research findings", "agent_template": "synthesizer", "focus_area": "final_answer", "dependencies": ["research_us", "research_cn"], "synthesis_input": false }}
+  ]
+}}
+
+Now generate the JSON execution plan for the query. Respond with ONLY the JSON, no additional text."""
+        
+        return await self._execute_agent_stage(planner, planning_prompt, session, "Intelligent Planning")
+
+    def _parse_execution_plan(self, planning_response: str) -> Dict[str, Any]:
+        """Parse the JSON execution plan from the planner's response."""
+        import json
+        import re
+        
+        try:
+            # Clean the response to extract JSON
+            cleaned_response = planning_response.strip()
+            
+            # Try to find JSON in the response using better regex
+            json_match = re.search(r'\{.*?"plan".*?\[.*?\].*?\}', cleaned_response, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+            else:
+                # Try to extract everything between first { and last }
+                start_idx = cleaned_response.find('{')
+                end_idx = cleaned_response.rfind('}')
+                if start_idx != -1 and end_idx != -1:
+                    json_str = cleaned_response[start_idx:end_idx+1]
+                else:
+                    json_str = cleaned_response
+            
+            # Clean up common JSON issues
+            json_str = json_str.replace('\n', ' ').replace('\t', ' ')
+            # Fix trailing commas
+            json_str = re.sub(r',\s*}', '}', json_str)
+            json_str = re.sub(r',\s*]', ']', json_str)
+            
+            # Parse JSON
+            plan = json.loads(json_str)
+            
+            # Validate plan structure
+            if not isinstance(plan, dict) or 'plan' not in plan:
+                logger.warning("Invalid plan structure - missing 'plan' key")
+                return None
+            
+            # Validate each stage
+            valid_templates = ['comparative_researcher', 'geographic_researcher', 'coder_specialist', 'synthesizer']
+            for stage in plan['plan']:
+                required_fields = ['stage_id', 'prompt', 'agent_template', 'focus_area', 'dependencies', 'synthesis_input']
+                if not all(field in stage for field in required_fields):
+                    logger.warning(f"Invalid stage structure: {stage}")
+                    return None
+                
+                # Validate agent template
+                if stage['agent_template'] not in valid_templates:
+                    logger.warning(f"Invalid agent template '{stage['agent_template']}' in stage {stage['stage_id']}")
+                    # Try to fix common template names
+                    template_mapping = {
+                        'data_researcher': 'comparative_researcher',
+                        'comparative_analyst': 'comparative_researcher',
+                        'visualization_specialist': 'coder_specialist',
+                        'researcher': 'comparative_researcher'
+                    }
+                    if stage['agent_template'] in template_mapping:
+                        stage['agent_template'] = template_mapping[stage['agent_template']]
+                        logger.info(f"Fixed agent template to: {stage['agent_template']}")
+                    else:
+                        logger.error(f"Cannot fix invalid agent template: {stage['agent_template']}")
+                        return None
+            
+            logger.info(f"Successfully parsed execution plan with {len(plan['plan'])} stages")
+            return plan
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON plan: {e}")
+            logger.error(f"Response was: {planning_response}")
+            return None
+        except Exception as e:
+            logger.error(f"Error parsing execution plan: {e}")
+            return None
+
+    def _display_execution_plan(self, execution_plan: Dict[str, Any]) -> None:
+        """Display the execution plan to the user."""
+        print("\n" + "="*60)
+        print("GROK HEAVY - Dynamic Execution Plan")
+        print("="*60)
+        
+        plan_stages = execution_plan['plan']
+        
+        for i, stage in enumerate(plan_stages, 1):
+            stage_id = stage['stage_id']
+            agent_template = stage['agent_template']
+            focus_area = stage['focus_area']
+            dependencies = stage['dependencies']
+            
+            print(f"\nStage {i}: {stage_id} ({agent_template})")
+            print(f"   Focus: {focus_area}")
+            if dependencies:
+                print(f"   Depends on: {', '.join(dependencies)}")
+            else:
+                print(f"   Dependencies: None (can start immediately)")
+        
+        print("\nExecuting plan...")
+        print("-" * 60)
+        print()
+
+    async def _execute_dynamic_plan(self, execution_plan: Dict[str, Any], query: str, active_agents: List[WorkerAgent], session: aiohttp.ClientSession) -> Dict[str, Any]:
+        """Execute the dynamic plan with dependency management."""
+        plan_stages = execution_plan['plan']
+        completed_stages = []
+        stage_outputs = {}
+        stage_results = []
+        execution_log = []
+        
+        max_iterations = len(plan_stages) + 2  # Safety valve
+        iteration = 0
+        
+        while len(completed_stages) < len(plan_stages) and iteration < max_iterations:
+            iteration += 1
+            
+            # Find stages that are ready to execute
+            ready_stages = []
+            for stage in plan_stages:
+                stage_id = stage['stage_id']
+                if stage_id not in completed_stages:
+                    dependencies = stage['dependencies']
+                    if all(dep in completed_stages for dep in dependencies):
+                        ready_stages.append(stage)
+            
+            if not ready_stages:
+                error_msg = f"No ready stages found. Completed: {completed_stages}, Remaining: {[s['stage_id'] for s in plan_stages if s['stage_id'] not in completed_stages]}"
+                logger.error(error_msg)
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'execution_log': execution_log,
+                    'stage_results': stage_results
+                }
+            
+            # Execute ready stages in parallel
+            logger.info(f"Executing {len(ready_stages)} parallel stages: {[s['stage_id'] for s in ready_stages]}")
+            print(f"\n>>> EXECUTING [{', '.join([s['stage_id'] for s in ready_stages])}] in parallel...")
+            for stage in ready_stages:
+                print(f"   - Running '{stage['stage_id']}' with agent {stage['agent_template']}...")
+            
+            # Create tasks for parallel execution
+            tasks = []
+            for stage in ready_stages:
+                task = asyncio.create_task(self._execute_plan_stage(stage, query, stage_outputs, active_agents, session))
+                tasks.append((stage, task))
+            
+            # Wait for all tasks to complete
+            for stage, task in tasks:
+                try:
+                    result = await task
+                    stage_results.append(result)
+                    
+                    if result['success']:
+                        completed_stages.append(stage['stage_id'])
+                        stage_outputs[stage['stage_id']] = result['response']
+                        logger.info(f"Completed stage: {stage['stage_id']}")
+                        print(f"\n[SUCCESS] {stage['stage_id']} completed.")
+                    else:
+                        logger.error(f"Failed stage: {stage['stage_id']} - {result.get('error', 'Unknown error')}")
+                        print(f"\n[FAILED] {stage['stage_id']}: {result.get('error', 'Unknown error')}")
+                        return {
+                            'success': False,
+                            'error': f"Stage {stage['stage_id']} failed: {result.get('error', 'Unknown error')}",
+                            'execution_log': execution_log,
+                            'stage_results': stage_results
+                        }
+                except Exception as e:
+                    logger.error(f"Exception in stage {stage['stage_id']}: {str(e)}")
+                    return {
+                        'success': False,
+                        'error': f"Exception in stage {stage['stage_id']}: {str(e)}",
+                        'execution_log': execution_log,
+                        'stage_results': stage_results
+                    }
+            
+            execution_log.append({
+                'iteration': iteration,
+                'executed_stages': [s['stage_id'] for s in ready_stages],
+                'completed_total': len(completed_stages),
+                'remaining': len(plan_stages) - len(completed_stages)
+            })
+        
+        # Find the final response (from the last stage or synthesis stage)
+        final_response = None
+        for stage in reversed(plan_stages):
+            if stage['stage_id'] in stage_outputs:
+                final_response = stage_outputs[stage['stage_id']]
+                break
+        
+        if not final_response:
+            final_response = "Plan execution completed but no final response found."
+        
+        print(f"\n[SUCCESS] ALL STAGES COMPLETED successfully!")
+        print("-" * 60)
+        
+        return {
+            'success': True,
+            'final_response': final_response,
+            'execution_log': execution_log,
+            'stage_results': stage_results
+        }
+
+    async def _execute_plan_stage(self, stage: Dict[str, Any], query: str, stage_outputs: Dict[str, str], active_agents: List[WorkerAgent], session: aiohttp.ClientSession) -> Dict[str, Any]:
+        """Execute a single stage of the dynamic plan."""
+        stage_id = stage['stage_id']
+        agent_template = stage['agent_template']
+        focus_area = stage['focus_area']
+        base_prompt = stage['prompt']
+        dependencies = stage['dependencies']
+        
+        # Find or spawn the appropriate agent
+        agent = self._find_or_spawn_agent(agent_template, focus_area, active_agents)
+        if not agent:
+            return {
+                'success': False,
+                'error': f"Could not find or spawn agent for template: {agent_template}",
+                'stage_id': stage_id,
+                'agent_template': agent_template
+            }
+        
+        # Construct the full prompt with context from dependencies
+        full_prompt = f"Original Query: {query}\n\n"
+        
+        # Add dependency outputs as context
+        if dependencies:
+            full_prompt += "Context from Previous Stages:\n"
+            for dep_id in dependencies:
+                if dep_id in stage_outputs:
+                    full_prompt += f"\n**[{dep_id}]:**\n{stage_outputs[dep_id]}\n"
+            full_prompt += "\n"
+        
+        # Add the specific stage prompt
+        full_prompt += f"Your Task: {base_prompt}\n\n"
+        
+        # Add specialization based on agent template
+        if agent_template == "synthesizer":
+            full_prompt += "As the Synthesizer, combine all the provided context into a comprehensive, well-structured final response that fully addresses the original query."
+        elif agent_template == "comparative_researcher":
+            full_prompt += f"As a Comparative Researcher focusing on '{focus_area}', provide detailed analysis and research specifically about this subject."
+        elif agent_template == "coder_specialist":
+            full_prompt += "As a Coding Specialist, write and execute Python code to address any computational requirements. Use the code_executor tool as needed."
+        else:
+            full_prompt += f"Focus your expertise on '{focus_area}' and provide high-quality analysis."
+        
+        # Execute the stage
+        try:
+            result = await self._execute_agent_stage(agent, full_prompt, session, f"Stage: {stage_id}")
+            result['stage_id'] = stage_id
+            result['agent_template'] = agent_template
+            result['focus_area'] = focus_area
+            return result
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e),
+                'stage_id': stage_id,
+                'agent_template': agent_template,
+                'focus_area': focus_area
+            }
+
+    def _find_or_spawn_agent(self, agent_template: str, focus_area: str, active_agents: List[WorkerAgent]) -> Optional[WorkerAgent]:
+        """Find an existing agent or spawn a new one for the given template."""
+        # First, try to find an existing agent with the right role
+        template_to_role = {
+            'synthesizer': 'synthesizer',
+            'comparative_researcher': 'researcher',
+            'coder_specialist': 'researcher',
+            'geographic_researcher': 'researcher'
+        }
+        
+        target_role = template_to_role.get(agent_template)
+        if target_role:
+            for agent in active_agents:
+                if hasattr(agent, 'agent_config') and agent.agent_config.get('role') == target_role:
+                    return agent
+        
+        # If no existing agent found, try to spawn one
+        spawned_agent = self._spawn_agent(agent_template, focus_area, f"Dynamic plan execution for {agent_template}")
+        if spawned_agent:
+            return spawned_agent
+        
+        # Fallback to any available agent
+        if active_agents:
+            logger.warning(f"Using fallback agent for template {agent_template}")
+            return active_agents[0]
+        
+        return None 
     async def _orchestrate_sequential_dynamic(self, query: str, session_id: str, enable_critique: bool, active_agents: List[WorkerAgent]) -> Dict[str, Any]:
-        """Sequential orchestration with dynamic agents - fallback method."""
-        # For now, just fall back to parallel mode with the active agents
-        return await self._orchestrate_parallel_dynamic(query, session_id, active_agents)
+        """Advanced sequential orchestration with dynamic planning and execution."""
+        logger.info("Starting dynamic sequential orchestration with intelligent planning...")
+        
+        orchestration_log = {
+            'mode': 'sequential_dynamic',
+            'stages': [],
+            'agents_used': [],
+            'plan': None,
+            'plan_execution': []
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            try:
+                # Stage 1: Intelligent Planning
+                logger.info("Stage 1: Intelligent Planning...")
+                planner = self._find_agent_by_role('planner') or active_agents[0]
+                
+                planning_result = await self._execute_intelligent_planning(planner, query, session)
+                orchestration_log['stages'].append(planning_result)
+                orchestration_log['agents_used'].append(planner.name)
+                
+                if not planning_result['success']:
+                    logger.error("Planning stage failed, falling back to parallel mode")
+                    return await self._orchestrate_parallel_dynamic(query, session_id, active_agents)
+                
+                # Parse the execution plan
+                execution_plan = self._parse_execution_plan(planning_result['response'])
+                orchestration_log['plan'] = execution_plan
+                
+                if not execution_plan or not execution_plan.get('plan'):
+                    logger.warning("No valid execution plan received, falling back to parallel mode")
+                    return await self._orchestrate_parallel_dynamic(query, session_id, active_agents)
+                
+                # Stage 2: Execute the Plan
+                logger.info(f"Stage 2: Executing Dynamic Plan ({len(execution_plan['plan'])} stages)...")
+                self._display_execution_plan(execution_plan)
+                
+                plan_execution_result = await self._execute_dynamic_plan(execution_plan, query, active_agents, session)
+                orchestration_log['plan_execution'] = plan_execution_result['execution_log']
+                orchestration_log['stages'].extend(plan_execution_result['stage_results'])
+                
+                if not plan_execution_result['success']:
+                    return {
+                        'success': False,
+                        'error': plan_execution_result['error'],
+                        'orchestration_log': orchestration_log
+                    }
+                
+                # Get the final response from the plan execution
+                final_response = plan_execution_result['final_response']
+                
+                # Calculate total usage
+                total_usage = self._calculate_orchestration_usage(orchestration_log)
+                
+                return {
+                    'success': True,
+                    'final_response': final_response,
+                    'orchestration_log': orchestration_log,
+                    'total_usage': total_usage
+                }
+                
+            except Exception as e:
+                logger.error(f"Dynamic sequential orchestration error: {str(e)}")
+                return {
+                    'success': False,
+                    'error': str(e),
+                    'orchestration_log': orchestration_log
+                }

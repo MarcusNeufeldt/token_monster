@@ -46,7 +46,7 @@ deliberation:
   max_context_length: 8000
   enable_critique_rounds: true
   max_critique_rounds: 1  # Reduced for speed
-  orchestration_mode: "parallel"  # Changed back to parallel for speed
+  orchestration_mode: "sequential"  # Changed to sequential for dynamic planning
 
 # Dynamic Agent Spawning Configuration
 dynamic_spawning:
@@ -65,17 +65,27 @@ dynamic_spawning:
       base_role: "researcher"
       specialization: "comparative_analysis"
       focus_area: "{subject}"  # Placeholder for specific subject
+      model: "x-ai/grok-3-mini-beta"
     
     geographic_researcher:
       base_role: "researcher" 
       specialization: "geographic_research"
       focus_area: "{region}"  # Placeholder for specific region
+      model: "x-ai/grok-3-mini-beta"
     
     coder_specialist:
       base_role: "researcher"
       specialization: "code_generation"
       focus_area: "programming"
       capabilities: ["code_executor", "data_visualization"]
+      model: "x-ai/grok-3-mini-beta"
+    
+    synthesizer:
+      base_role: "synthesizer"
+      specialization: "final_synthesis"
+      focus_area: "comprehensive_response"
+      model: "x-ai/grok-3-mini-beta"
+      reasoning_effort: "high"
 
 # System Settings
 system:
